@@ -1,18 +1,24 @@
-use color_eyre::{Help, Report};
-use libc::{c_ulong, c_ulonglong, syscall};
-use std::ffi::{c_char, CStr, CString, OsStr, OsString};
-use std::fs::{self, create_dir, remove_dir, write, File};
-use std::io::Read;
-use std::mem::{size_of, size_of_val};
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
-use std::os::unix::prelude::{FileExt, OsStrExt};
+use std::ffi::{c_char, CString, OsStr};
+use std::fs::{create_dir, read, remove_dir, write, File};
+use std::mem::{self, size_of_val};
+use std::os::fd::AsRawFd;
+use std::os::unix::prelude::OsStrExt;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::exit;
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::{fs::read, path::PathBuf};
+use std::path::PathBuf;
+use std::process::Command;
+use std::time::SystemTime;
+
+use libc::c_ulonglong;
+
+use nix::sys::resource::Usage;
+use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, Signal};
+use nix::sys::signalfd::SigSet;
 use tempfile::tempdir_in;
 
-use color_eyre::eyre::{self, eyre, ContextCompat, Result, WrapErr};
+use color_eyre::eyre::{eyre, ContextCompat, Result, WrapErr};
+use color_eyre::{Help, Report};
+use thiserror::Error;
 
 #[derive(Debug)]
 struct Meta {
@@ -28,13 +34,7 @@ fn main() -> Result<()> {
 
     let meta = Meta::new_from_args()?;
 
-    if let Err(err) = real_main(&meta) {
-        // TODO: how to handle multiple error via eyre?
-        meta.tear_down();
-        return Err(err);
-    }
-    meta.tear_down()?;
-    Ok(())
+    join_errors(vec![real_main(&meta), meta.tear_down()])
 }
 
 fn real_main(meta: &Meta) -> Result<()> {
@@ -113,19 +113,20 @@ impl Meta {
         let cgroup_file =
             File::open(self.cg_dir.as_path()).wrap_err("openning the cgroup for execution")?;
         let mut pid_fd: c_ulonglong = 0;
+
         let ca = libc::clone_args {
             flags: (libc::CLONE_NEWCGROUP | libc::CLONE_PIDFD | libc::CLONE_VFORK)
                 as libc::c_ulonglong,
             pidfd: &mut pid_fd as *mut c_ulonglong as c_ulonglong,
+            exit_signal: libc::SIGCHLD as libc::c_ulonglong,
+            cgroup: cgroup_file.as_raw_fd() as c_ulonglong,
             child_tid: 0,
             parent_tid: 0,
-            exit_signal: libc::SIGCHLD as libc::c_ulonglong,
             stack: 0,
             stack_size: 0,
             tls: 0,
             set_tid: 0,
             set_tid_size: 0,
-            cgroup: cgroup_file.as_raw_fd() as c_ulonglong,
         };
 
         let start = SystemTime::now();
@@ -136,6 +137,7 @@ impl Meta {
             pid = libc::syscall(libc::SYS_clone3, &ca, size_of_val(&ca)) as libc::pid_t;
         }
 
+        // failed to clone
         if pid == -1 {
             let err_msg = "failed to call clone3";
             unsafe {
@@ -147,32 +149,43 @@ impl Meta {
 
         // child
         if pid == 0 {
-            // TODO: Use https://doc.rust-lang.org/std/os/unix/process/trait.CommandExt.html#tymethod.exec instead of unsafe syscall
-            let cmd_ptr = CString::new(self.child_argv[0].as_str())?.as_ptr();
-            let args: Vec<*const c_char> = self.child_argv[1..]
-                .iter()
-                .map(|s| {
-                    CString::new(s.as_str())
-                        .wrap_err_with(|| format!("converting to CString for {}", s))
-                        .unwrap()
-                        .as_ptr() as *const c_char
-                }) // TODO: how to pop up error here?
-                .collect();
-            let args_ptr = args.as_ptr() as *const *const c_char;
+            let mut cmd = Command::new(&self.child_argv[0]);
+            let err = cmd.args(&self.child_argv[1..]).exec();
+            return Err(err).wrap_err("executing the child process");
+        }
 
-            // Safety: executing a command won't leak any memory, or?
-            unsafe {
-                libc::execv(cmd_ptr, args_ptr);
-            }
-            let err_msg = "failed to exec child";
+        // parent
+
+        // Ignore SIGINT and SIGQUIT for the cgmemtime parent process, as otherwise, Ctrl+C/+] also kill cgmemtime before it has a chance printing its summary
+        let sa = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+        unsafe {
+            sigaction(Signal::SIGINT, &sa)?;
+            sigaction(Signal::SIGQUIT, &sa)?;
+        }
+
+        let mut usg = mem::MaybeUninit::<libc::rusage>::uninit();
+
+        let mut ret: libc::c_long = 0;
+
+        // Safety: calling the raw syscall to wait pidfd of the child process
+        unsafe {
+            ret = libc::syscall(
+                libc::SYS_waitid,
+                pid_fd as libc::idtype_t,
+                0 as libc::uintptr_t,
+                libc::WEXITED,
+                usg.as_mut_ptr(),
+            );
+        }
+        if ret == -1 {
+            let err_msg = "failed to wait child";
             unsafe {
                 // Safety: just printing the error
                 libc::perror(CString::new(err_msg)?.as_ptr() as *const c_char);
             }
-            exit(1);
+            return Err(eyre!(err_msg));
         }
 
-        // parent
         let wall_duration = SystemTime::now().duration_since(start)?;
         Ok(())
     }
@@ -190,18 +203,26 @@ impl Meta {
     }
 }
 
-fn join_errors(
-    results: Vec<Result<(), impl std::error::Error + Send + Sync + 'static>>,
-) -> Result<(), Report> {
+fn join_errors(results: Vec<Result<(), Report>>) -> Result<(), Report> {
+    #[derive(Debug, Error)]
+    #[error("{0}")]
+    struct StrError(String);
+
     if results.iter().all(|r| r.is_ok()) {
         return Ok(());
     }
 
-    results
-        .into_iter()
-        .filter(Result::is_err)
-        .map(Result::unwrap_err)
-        .fold(Err(eyre!("encountered multiple errors")), |report, e| {
+    let results: Vec<Result<(), Report>> = results.into_iter().filter(Result::is_err).collect();
+
+    if results.len() == 1 {
+        return results.into_iter().next().unwrap();
+    }
+
+    results.into_iter().map(Result::unwrap_err).fold(
+        Err(eyre!("encountered multiple errors")),
+        |report, e| {
+            let e = StrError(format!("{:#}", e));
             report.error(e)
-        })
+        },
+    )
 }
