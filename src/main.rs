@@ -1,4 +1,4 @@
-use std::ffi::{c_char, CString, OsStr};
+use std::ffi::{CString, OsStr};
 use std::fs::{create_dir, read, remove_dir, write, File};
 use std::mem::{self, size_of_val};
 use std::os::fd::AsRawFd;
@@ -7,11 +7,8 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-use libc::c_ulonglong;
-
-use nix::sys::resource::Usage;
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, Signal};
 use nix::sys::signalfd::SigSet;
 use tempfile::tempdir_in;
@@ -26,7 +23,6 @@ struct Meta {
     cg_pdir: PathBuf,
     cg_dir: PathBuf,
     child_argv: Vec<String>,
-    delim: char,
 }
 
 fn main() -> Result<()> {
@@ -41,7 +37,7 @@ fn real_main(meta: &Meta) -> Result<()> {
     meta.precheck()?;
     meta.setup_cgroup()?;
 
-    //meta.execute()?;
+    meta.execute()?;
 
     Ok(())
 }
@@ -54,7 +50,6 @@ impl Meta {
             cg_pdir: PathBuf::new(),
             cg_dir: PathBuf::new(),
             child_argv: vec![String::from("sleep"), String::from("1")],
-            delim: ';',
         };
 
         if let Some("") = meta.cg_pdir.to_str() {
@@ -112,14 +107,16 @@ impl Meta {
     fn execute(&self) -> Result<()> {
         let cgroup_file =
             File::open(self.cg_dir.as_path()).wrap_err("openning the cgroup for execution")?;
-        let mut pid_fd: c_ulonglong = 0;
+
+        let mut pid_fd: libc::c_ulonglong = 0;
+
+        const CLONE_INTO_CGRUOP: libc::c_ulonglong = 0x200000000;
 
         let ca = libc::clone_args {
-            flags: (libc::CLONE_NEWCGROUP | libc::CLONE_PIDFD | libc::CLONE_VFORK)
-                as libc::c_ulonglong,
-            pidfd: &mut pid_fd as *mut c_ulonglong as c_ulonglong,
+            flags: (libc::CLONE_PIDFD | libc::CLONE_VFORK) as libc::c_ulonglong | CLONE_INTO_CGRUOP,
+            pidfd: &mut pid_fd as *mut libc::c_ulonglong as libc::c_ulonglong,
             exit_signal: libc::SIGCHLD as libc::c_ulonglong,
-            cgroup: cgroup_file.as_raw_fd() as c_ulonglong,
+            cgroup: cgroup_file.as_raw_fd() as libc::c_ulonglong,
             child_tid: 0,
             parent_tid: 0,
             stack: 0,
@@ -131,20 +128,16 @@ impl Meta {
 
         let start = SystemTime::now();
 
+        let pid: libc::pid_t;
+
         // Safety: we'll wait on the pidfd later
-        let mut pid: libc::pid_t = -1;
         unsafe {
             pid = libc::syscall(libc::SYS_clone3, &ca, size_of_val(&ca)) as libc::pid_t;
-        }
-
-        // failed to clone
-        if pid == -1 {
-            let err_msg = "failed to call clone3";
-            unsafe {
-                // Safety: just printing the error
-                libc::perror(CString::new(err_msg)?.as_ptr() as *const c_char);
+            if pid == -1 {
+                let err_msg = "failed to call clone3";
+                libc::perror(CString::new(err_msg)?.as_ptr());
+                return Err(eyre!(err_msg));
             }
-            return Err(eyre!(err_msg));
         }
 
         // child
@@ -165,28 +158,51 @@ impl Meta {
 
         let mut usg = mem::MaybeUninit::<libc::rusage>::uninit();
 
-        let mut ret: libc::c_long = 0;
-
         // Safety: calling the raw syscall to wait pidfd of the child process
         unsafe {
-            ret = libc::syscall(
+            if libc::syscall(
                 libc::SYS_waitid,
+                libc::P_PIDFD,
                 pid_fd as libc::idtype_t,
                 0 as libc::uintptr_t,
                 libc::WEXITED,
                 usg.as_mut_ptr(),
-            );
-        }
-        if ret == -1 {
-            let err_msg = "failed to wait child";
-            unsafe {
-                // Safety: just printing the error
-                libc::perror(CString::new(err_msg)?.as_ptr() as *const c_char);
+            ) == -1
+            {
+                let err_msg = "failed to wait child";
+                libc::perror(CString::new(err_msg)?.as_ptr());
+                return Err(eyre!(err_msg));
             }
-            return Err(eyre!(err_msg));
         }
 
-        let wall_duration = SystemTime::now().duration_since(start)?;
+        // Safety: the rusage is filled by the waitid syscall
+        let usg = unsafe { usg.assume_init() };
+        let user_time = timeval_to_duration(&usg.ru_utime);
+        let sys_time = timeval_to_duration(&usg.ru_stime);
+        let wall_time = SystemTime::now().duration_since(start)?;
+        let maxrss = usg.ru_maxrss * 1024;
+
+        let bs = read(self.cg_dir.join("memory.peak"))?;
+        let peak: u64 = OsStr::from_bytes(&bs[..bs.len() - 1])
+            .to_str()
+            .wrap_err("failed to convert from OsStr to Rust str")?
+            .parse()
+            .wrap_err("failed to parse to u64")?;
+
+        println!(
+            r#"
+user: {:?}
+sys : {:?}
+wall: {:?}
+child_RSS_high: {:?} KiB
+group_mem_high: {:?} KiB
+"#,
+            user_time,
+            sys_time,
+            wall_time,
+            maxrss / 1024,
+            peak / 1024,
+        );
         Ok(())
     }
 
@@ -225,4 +241,10 @@ fn join_errors(results: Vec<Result<(), Report>>) -> Result<(), Report> {
             report.error(e)
         },
     )
+}
+
+fn timeval_to_duration(tv: &libc::timeval) -> Duration {
+    let seconds = tv.tv_sec as u64;
+    let microseconds = tv.tv_usec as u64;
+    Duration::new(seconds, (microseconds * 1000) as u32)
 }
