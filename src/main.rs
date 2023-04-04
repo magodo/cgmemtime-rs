@@ -1,3 +1,8 @@
+use clap::Parser;
+use color_eyre::eyre::{eyre, ContextCompat, Result, WrapErr};
+use color_eyre::{Help, Report};
+use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, Signal};
+use nix::sys::signalfd::SigSet;
 use std::ffi::{CString, OsStr};
 use std::fs::{create_dir, read, remove_dir, write, File};
 use std::mem::{self, size_of_val};
@@ -8,14 +13,22 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, SystemTime};
-
-use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, Signal};
-use nix::sys::signalfd::SigSet;
 use tempfile::tempdir_in;
-
-use color_eyre::eyre::{eyre, ContextCompat, Result, WrapErr};
-use color_eyre::{Help, Report};
 use thiserror::Error;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Cgroup v2 base
+    #[arg(short = 'm', default_value_os_t=PathBuf::from("/sys/fs/cgroup"))]
+    cg_fs_dir: PathBuf,
+
+    /// Cgroup directory [default: $CGFS/user.slice/user-$UID.slice/user@$UID.service/<random>]
+    #[arg(short = 'c')]
+    cg_pdir: Option<PathBuf>,
+
+    command: Vec<String>,
+}
 
 #[derive(Debug)]
 struct Meta {
@@ -27,32 +40,35 @@ struct Meta {
 
 fn main() -> Result<()> {
     color_eyre::install()?;
-
     let meta = Meta::new_from_args()?;
-
     join_errors(vec![real_main(&meta), meta.tear_down()])
 }
 
 fn real_main(meta: &Meta) -> Result<()> {
     meta.precheck()?;
     meta.setup_cgroup()?;
-
     meta.execute()?;
-
     Ok(())
 }
 
 impl Meta {
     fn new_from_args() -> Result<Self> {
-        // TODO: use clap
+        let args = Args::parse();
+
+        if args.command.len() == 0 {
+            return Err(eyre!("no command specified"));
+        }
+
         let mut meta = Meta {
-            cg_fs_dir: PathBuf::from("/sys/fs/cgroup"),
-            cg_pdir: PathBuf::new(),
-            cg_dir: PathBuf::new(),
-            child_argv: vec![String::from("sleep"), String::from("1")],
+            cg_fs_dir: args.cg_fs_dir,
+            cg_pdir: PathBuf::default(),
+            cg_dir: PathBuf::default(),
+            child_argv: args.command,
         };
 
-        if let Some("") = meta.cg_pdir.to_str() {
+        if let Some(p) = args.cg_pdir {
+            meta.cg_pdir = p;
+        } else {
             // Create a temp cgroup under the current user's cgroup root (e.g. /user.slice/user-1000.slice/user@1000.service).
             // Otherwise, the current per process cgroup might disallow users to enable a specific
             // (i.e. memory) controller.
@@ -73,14 +89,14 @@ impl Meta {
             meta.cg_pdir = tempdir_in(user_cgroup_dir)
                 .wrap_err("creating the parent cgroup dir")?
                 .into_path();
-            meta.cg_dir = meta.cg_pdir.join("leaf");
         }
+
+        meta.cg_dir = meta.cg_pdir.join("leaf");
 
         Ok(meta)
     }
 
     fn precheck(&self) -> Result<()> {
-        // TODO: probably should check the user cgroup dir
         let path = self.cg_fs_dir.as_path();
         OsStr::from_bytes(read(path.join("cgroup.controllers"))?.as_slice())
             .to_str()

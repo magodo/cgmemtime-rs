@@ -11,3 +11,4 @@ tempfile = "3"
 libc = "0.2"
 thiserror = "1.0"
 nix = { version = "0.26", features = ["signal", "resource"]}
+clap = { version = "4.2.1", features = ["derive"] }
