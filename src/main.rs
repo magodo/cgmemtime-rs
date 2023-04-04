@@ -27,6 +27,7 @@ struct Args {
     #[arg(short = 'c')]
     cg_pdir: Option<PathBuf>,
 
+    #[arg(allow_hyphen_values(true))]
     command: Vec<String>,
 }
 
