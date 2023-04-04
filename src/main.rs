@@ -26,9 +26,9 @@ struct Args {
     /// Cgroup directory [default: $CGFS/user.slice/user-$UID.slice/user@$UID.service/<random>]
     #[arg(short = 'c')]
     cg_pdir: Option<PathBuf>,
-
-    #[arg(allow_hyphen_values(true))]
-    command: Vec<String>,
+    command: String,
+    #[arg(allow_hyphen_values = true)]
+    args: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -56,15 +56,11 @@ impl Meta {
     fn new_from_args() -> Result<Self> {
         let args = Args::parse();
 
-        if args.command.len() == 0 {
-            return Err(eyre!("no command specified"));
-        }
-
         let mut meta = Meta {
             cg_fs_dir: args.cg_fs_dir,
             cg_pdir: PathBuf::default(),
             cg_dir: PathBuf::default(),
-            child_argv: args.command,
+            child_argv: [vec![args.command], args.args].concat(),
         };
 
         if let Some(p) = args.cg_pdir {
